@@ -1,0 +1,318 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Live Market Dashboard</title>
+<style>
+  :root{--bg:#121212;--card:#1e1e1e;--muted:#888}
+  body{margin:0;font-family:Inter,Arial,Helvetica,sans-serif;background:var(--bg);color:#fff}
+  header{padding:12px 16px;text-align:center}
+  .top{display:flex;gap:12px;align-items:center;justify-content:center;flex-wrap:wrap;padding:8px 12px}
+  .tab{padding:8px 14px;background:#333;border-radius:8px;cursor:pointer}
+  .tab.active{background:#0066ff}
+  .controls{display:flex;gap:8px;justify-content:center;padding:8px;flex-wrap:wrap}
+  .control-btn{padding:8px 12px;background:#333;border-radius:8px;cursor:pointer}
+  .control-btn.active{background:#0066ff}
+  .container{max-width:1100px;margin:12px auto;padding:0 12px}
+  #ticker-wrap{background:var(--card);border-radius:8px;padding:8px;overflow:hidden;white-space:nowrap;margin-bottom:12px}
+  #ticker{display:inline-block;animation:scroll 25s linear infinite}
+  @keyframes scroll{0%{transform:translateX(100%)}100%{transform:translateX(-100%)}}
+  table{width:100%;border-collapse:collapse;background:transparent}
+  th,td{padding:10px;border-bottom:1px solid #2b2b2b;text-align:left}
+  th{color:var(--muted);font-weight:600}
+  tr:hover{background:#171717;cursor:pointer}
+  .up{color:#2ad26a;font-weight:600}
+  .down{color:#ff6b6b;font-weight:600}
+  #chart{margin-top:16px;border-radius:8px;overflow:hidden}
+  .small{font-size:13px;color:var(--muted)}
+  .flex{display:flex;gap:8px;align-items:center}
+  .search{padding:8px 10px;border-radius:8px;border:0;background:#222;color:#fff;width:240px}
+  .right{margin-left:auto}
+  @media (max-width:720px){ #chart{height:320px} }
+</style>
+</head>
+<body>
+<header>
+  <h1>📈 Live Market Dashboard</h1>
+  <div class="top">
+    <div class="tab active" id="tab-crypto">Crypto</div>
+    <div class="tab" id="tab-stocks">Stocks</div>
+    <input id="search" class="search" placeholder="Search (name or symbol)"/>
+  </div>
+</header>
+
+<div class="container">
+  <div id="ticker-wrap"><div id="ticker">Loading ticker…</div></div>
+
+  <div class="controls">
+    <div class="control-btn active" id="filter-all">All</div>
+    <div class="control-btn" id="filter-gainers">Top Gainers</div>
+    <div class="control-btn" id="filter-losers">Top Losers</div>
+    <div class="small right" id="lastUpdated">Last update: —</div>
+  </div>
+
+  <table>
+    <thead>
+      <tr><th style="width:80px">Symbol</th><th>Name</th><th style="width:140px">Price (USD)</th><th style="width:120px">24h %</th></tr>
+    </thead>
+    <tbody id="assetTable"></tbody>
+  </table>
+
+  <div id="chart"></div>
+</div>
+
+<!-- TradingView script (widgets) -->
+<script src="https://s3.tradingview.com/tv.js"></script>
+
+<script>
+/* ---------- CONFIG ---------- */
+const FINNHUB_KEY = "d3f59nhr01qh40fgtvv0d3f59nhr01qh40fgtvvg"; // your key
+const REFRESH_MS = 600; // 600ms as requested (CAUTION: may hit API rate limits)
+
+/* ---------- ASSETS ---------- */
+/* cryptos use CoinGecko ids + TradingView pair (BINANCE) */
+const CRYPTOS = [
+  { id:'bitcoin', sym:'BTC', name:'Bitcoin', tv:'BINANCE:BTCUSDT' },
+  { id:'ethereum', sym:'ETH', name:'Ethereum', tv:'BINANCE:ETHUSDT' },
+  { id:'binancecoin', sym:'BNB', name:'BNB', tv:'BINANCE:BNBUSDT' },
+  { id:'solana', sym:'SOL', name:'Solana', tv:'BINANCE:SOLUSDT' },
+  { id:'ripple', sym:'XRP', name:'XRP', tv:'BINANCE:XRPUSDT' },
+  { id:'dogecoin', sym:'DOGE', name:'Dogecoin', tv:'BINANCE:DOGEUSDT' },
+  { id:'cardano', sym:'ADA', name:'Cardano', tv:'BINANCE:ADAUSDT' }
+];
+
+/* stocks use ticker + TradingView symbol (exchange prefix) */
+const STOCKS = [
+  { id:'AAPL', sym:'AAPL', name:'Apple', tv:'NASDAQ:AAPL' },
+  { id:'MSFT', sym:'MSFT', name:'Microsoft', tv:'NASDAQ:MSFT' },
+  { id:'TSLA', sym:'TSLA', name:'Tesla', tv:'NASDAQ:TSLA' },
+  { id:'AMZN', sym:'AMZN', name:'Amazon', tv:'NASDAQ:AMZN' },
+  { id:'GOOGL', sym:'GOOGL', name:'Alphabet', tv:'NASDAQ:GOOGL' },
+  { id:'META', sym:'META', name:'Meta', tv:'NASDAQ:META' },
+  { id:'NVDA', sym:'NVDA', name:'Nvidia', tv:'NASDAQ:NVDA' }
+];
+
+let ALL = [...CRYPTOS, ...STOCKS];
+let currentCategory = 'crypto'; // 'crypto' | 'stocks' | 'all'
+let currentFilter = 'all'; // 'all' | 'gainers' | 'losers'
+let lastPrices = {};      // { symbol: number }
+let lastPercents = {};    // { symbol: percent }
+let tvWidgetInstance = null;
+let currentTVSymbol = null;
+
+/* ---------- UI helpers ---------- */
+const $ = id => document.getElementById(id);
+const setActiveTab = (which) => {
+  document.getElementById('tab-crypto').classList.toggle('active', which==='crypto');
+  document.getElementById('tab-stocks').classList.toggle('active', which==='stocks');
+};
+const setActiveFilterBtn = (filter) => {
+  ['filter-all','filter-gainers','filter-losers'].forEach(id=>{
+    document.getElementById(id).classList.toggle('active', id.endsWith(filter==='all'?'all': filter==='gainers'?'gainers':'losers'));
+  });
+};
+
+/* ---------- render table rows ---------- */
+function renderTable() {
+  const tbody = $('assetTable');
+  tbody.innerHTML = '';
+  const search = $('search').value.trim().toLowerCase();
+  let list = (currentCategory==='crypto'?CRYPTOS: currentCategory==='stocks'?STOCKS: ALL);
+
+  // optionally filter by gainers/losers
+  if (currentFilter !== 'all') {
+    list = list.slice().sort((a,b)=>{
+      const pa = lastPercents[a.sym] ?? 0;
+      const pb = lastPercents[b.sym] ?? 0;
+      return currentFilter==='gainers' ? pb - pa : pa - pb;
+    }).slice(0, 10); // top 10
+  }
+
+  list.forEach(asset=>{
+    if (search) {
+      const hay = (asset.sym + ' ' + asset.name).toLowerCase();
+      if (!hay.includes(search)) return;
+    }
+    const tr = document.createElement('tr');
+    tr.dataset.tv = asset.tv;
+    tr.dataset.sym = asset.sym;
+    tr.innerHTML = `
+      <td>${asset.sym}</td>
+      <td>${asset.name}</td>
+      <td class="price small">Loading...</td>
+      <td class="pct small">--</td>
+    `;
+    tr.onclick = ()=> loadTradingView(asset.tv, asset.name);
+    tbody.appendChild(tr);
+  });
+}
+
+/* ---------- update ticker (scrolling) ---------- */
+function updateTicker() {
+  const tickerEl = $('ticker');
+  const list = (currentCategory==='crypto'?CRYPTOS: currentCategory==='stocks'?STOCKS: ALL);
+  const spans = list.map(a=>{
+    const pct = (lastPercents[a.sym] ?? 0);
+    const cls = pct>0 ? 'up' : pct<0 ? 'down' : '';
+    const price = (lastPrices[a.sym]!==undefined) ? `$${(lastPrices[a.sym]).toFixed(2)}` : '—';
+    return `<span class="${cls}" style="margin-right:28px;cursor:pointer" data-tv="${a.tv}">${a.sym} ${price} (${pct>0?'+':''}${pct.toFixed(2)}%)</span>`;
+  }).join('');
+  tickerEl.innerHTML = spans;
+  // attach click handlers to ticker items (delegation)
+  tickerEl.querySelectorAll('span[data-tv]').forEach(s => {
+    s.onclick = (ev)=> {
+      const tv = s.getAttribute('data-tv');
+      const name = s.textContent.split(' ')[0];
+      loadTradingView(tv, name);
+    };
+  });
+}
+
+/* ---------- price fetching: CoinGecko for cryptos (batch), Finnhub for stocks (parallel) ---------- */
+async function fetchPricesOnce() {
+  const now = new Date();
+  $('lastUpdated').innerText = `Last update: ${now.toLocaleTimeString()}`;
+
+  // coins: batch via CoinGecko
+  try {
+    const ids = CRYPTOS.map(c=>c.id).join(',');
+    const cgUrl = `https://api.coingecko.com/api/v3/simple/price?ids=${ids}&vs_currencies=usd&include_24hr_change=true`;
+    const cgResp = await fetch(cgUrl);
+    if (cgResp.ok) {
+      const cgData = await cgResp.json();
+      CRYPTOS.forEach(c=>{
+        const info = cgData[c.id];
+        if (info && info.usd !== undefined) {
+          lastPrices[c.sym] = info.usd;
+          lastPercents[c.sym] = info.usd_24h_change ?? 0;
+        }
+      });
+    }
+  } catch(e){ console.warn('CoinGecko error', e); }
+
+  // stocks: parallel Finnhub requests
+  try {
+    const promises = STOCKS.map(s =>
+      fetch(`https://finnhub.io/api/v1/quote?symbol=${s.id}&token=${FINNHUB_KEY}`)
+        .then(r=>r.ok? r.json().catch(()=>null) : null)
+        .then(d => ({ s, d }))
+        .catch(()=> ({ s, d:null }))
+    );
+    const results = await Promise.all(promises);
+    results.forEach(({s, d})=>{
+      if (d && (d.c || d.c === 0)) {
+        lastPrices[s.sym] = d.c;
+        // Finnhub provides dp sometimes or compute from pc
+        lastPercents[s.sym] = (d.dp !== undefined && d.dp !== null) ? d.dp : (d.pc? ((d.c - d.pc)/d.pc*100) : 0);
+      }
+    });
+  } catch(e){ console.warn('Finnhub error', e); }
+
+  // update DOM table rows (only visible ones)
+  document.querySelectorAll('#assetTable tr').forEach(tr=>{
+    const sym = tr.dataset.sym;
+    const priceCell = tr.querySelector('.price');
+    const pctCell = tr.querySelector('.pct');
+    const p = lastPrices[sym];
+    const pct = lastPercents[sym];
+    if (p !== undefined) priceCell.textContent = `$${p.toFixed(2)}`; else priceCell.textContent = '—';
+    if (pct !== undefined) {
+      pctCell.textContent = `${pct>0?'+':''}${pct.toFixed(2)}%`;
+      pctCell.className = `pct small ${pct>0?'up': pct<0?'down':''}`;
+      priceCell.className = `price small ${pct>0?'up': pct<0?'down':''}`;
+    } else {
+      pctCell.textContent = '--'; pctCell.className = 'pct small';
+    }
+  });
+
+  updateTicker();
+
+  // update Top Gainers/Losers UI if filter active
+  if (currentFilter === 'gainers' || currentFilter === 'losers') {
+    renderTable(); // will re-sort via lastPercents in showFiltered below
+  }
+}
+
+/* ---------- helpers for filters/pagination ---------- */
+function showAll() { currentFilter = 'all'; setFilterButtons(); renderTable(); }
+function showGainers() { currentFilter = 'gainers'; setFilterButtons(); renderTable(); sortByPercent(true); }
+function showLosers() { currentFilter = 'losers'; setFilterButtons(); renderTable(); sortByPercent(false); }
+
+function setFilterButtons() {
+  $('filter-all')?.classList.toggle('active', currentFilter==='all');
+  $('filter-gainers')?.classList.toggle('active', currentFilter==='gainers');
+  $('filter-losers')?.classList.toggle('active', currentFilter==='losers');
+}
+
+function sortByPercent(gainers=true) {
+  // reorder tbody rows by percent
+  const tbody = $('assetTable');
+  const rows = Array.from(tbody.querySelectorAll('tr'));
+  rows.sort((a,b)=>{
+    const aSym = a.dataset.sym, bSym = b.dataset.sym;
+    const pa = lastPercents[aSym] ?? 0, pb = lastPercents[bSym] ?? 0;
+    return gainers ? (pb - pa) : (pa - pb);
+  });
+  tbody.innerHTML = '';
+  rows.forEach(r => tbody.appendChild(r));
+}
+
+/* ---------- TradingView chart loader (creates widget only on click) ---------- */
+function loadTradingView(tvSymbol, title) {
+  if (!tvSymbol) return;
+  currentTVSymbol = tvSymbol;
+  // remove old widget container content and create new
+  const chartDiv = $('chart');
+  chartDiv.innerHTML = '<div id="tv_inner" style="height:600px"></div>';
+
+  // create widget
+  try {
+    new TradingView.widget({
+      container_id: "tv_inner",
+      autosize: true,
+      symbol: tvSymbol,
+      interval: "1",
+      timezone: "Etc/UTC",
+      theme: "dark",
+      style: "1",
+      locale: "en",
+      toolbar_bg: "#1f1f1f",
+      allow_symbol_change: true,
+      hide_legend: false
+    });
+  } catch(e){
+    console.error('TradingView init error', e);
+    chartDiv.innerHTML = '<div class="small">Chart failed to load (check network or widget restrictions).</div>';
+  }
+}
+
+/* ---------- wire UI events ---------- */
+document.getElementById('tab-crypto').onclick = ()=>{ currentCategory='crypto'; setActiveTab('crypto'); renderTable(); fetchPricesOnce(); };
+document.getElementById('tab-stocks').onclick = ()=>{ currentCategory='stocks'; setActiveTab('stocks'); renderTable(); fetchPricesOnce(); };
+
+document.getElementById('filter-all').onclick = ()=>{ currentFilter='all'; setFilterButtons(); renderTable(); };
+document.getElementById('filter-gainers').onclick = ()=>{ currentFilter='gainers'; setFilterButtons(); renderTable(); sortByPercent(true); };
+document.getElementById('filter-losers').onclick = ()=>{ currentFilter='losers'; setFilterButtons(); renderTable(); sortByPercent(false); };
+
+$('search').addEventListener('input', ()=>renderTable());
+
+/* ---------- initial render + periodic updates ---------- */
+renderTable();
+(async ()=>{
+  // immediate first paint for table, then fetch prices in parallel
+  await fetchPricesOnce();        // initial fast fetch
+  // then run frequent updates (careful: rate-limits possible)
+  setInterval(fetchPricesOnce, REFRESH_MS);
+})();
+
+/* ---------- delegate clicks on ticker items (since ticker rebuilt) ---------- */
+document.getElementById('ticker').addEventListener('click', (e)=>{
+  const tv = e.target && e.target.getAttribute && e.target.getAttribute('data-tv');
+  if (tv) {
+    loadTradingView(tv, '');
+  }
+});
+</script>
+</body>
+</html>
